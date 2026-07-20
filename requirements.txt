@@ -1,1 +1,4 @@
-streamlit-searchbox
+streamlit
+langgraph
+langchain-google-genai
+requests

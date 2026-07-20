@@ -1,27 +1,28 @@
 """
-TRAVEL PLANNER — Flight Search with Dynamic UI Inputs
-==========================================================
+TRAVEL AGENT — AI agent with flight + hotel search tools
+============================================================
 
-NEW CONCEPT: st.form + input widgets, so the user provides origin,
-destination, and date through the browser instead of hardcoded values.
-
-st.form groups multiple inputs together so the app only re-runs ONCE,
-when the "Search" button is clicked — not on every single keystroke,
-which is what would happen with ungrouped widgets.
+This is a genuine AI agent, not a form: you chat naturally
+("find me cheap flights from Lucknow to Delhi next week"), and
+Gemini decides WHICH tool to call (flights, hotels, both, or
+neither) and WHAT arguments to pass — same LangGraph pattern as
+the weather + currency agent, just with travel-specific tools.
 """
 
-import streamlit as st
-from streamlit_searchbox import st_searchbox
-import requests
 import os
+from datetime import datetime
+
+import streamlit as st
+import requests
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langchain_core.tools import tool
+from langgraph.graph import StateGraph, MessagesState, START, END
+from langgraph.prebuilt import ToolNode, tools_condition
 
 TRAVELPAYOUTS_TOKEN = os.environ.get("TRAVELPAYOUTS_API_TOKEN") or st.secrets.get(
     "TRAVELPAYOUTS_API_TOKEN", ""
 )
 
-# Airlines are returned as 2-letter IATA codes, not names. This lookup
-# covers major carriers relevant to Indian/international routes; any
-# code not in this dict just falls back to showing the raw code.
 AIRLINE_NAMES = {
     "IX": "Air India Express",
     "AI": "Air India",
@@ -62,62 +63,39 @@ def airline_name(code: str) -> str:
     return AIRLINE_NAMES.get(code, code)
 
 
-def search_city(query: str) -> list[dict]:
-    """Look up cities/airports matching a typed name. Returns a list of
-    dicts with 'name', 'code', 'country', 'type' — no API key needed,
-    this is a free public Travelpayouts endpoint."""
-    if not query or len(query) < 2:
-        return []
-
+def resolve_city_code(city_name: str) -> str:
+    """Turn a typed city name into an IATA code using the free
+    Travelpayouts autocomplete endpoint. Returns '' if no match."""
     url = "https://autocomplete.travelpayouts.com/places2"
-    params = {"term": query, "locale": "en", "types[]": ["city", "airport"]}
+    params = {"term": city_name, "locale": "en", "types[]": ["city", "airport"]}
     response = requests.get(url, params=params)
-
     if response.status_code != 200:
-        return []
-
-    results = []
-    for item in response.json():
-        results.append(
-            {
-                "name": item.get("name", ""),
-                "code": item.get("code", ""),
-                "country": item.get("country_name", ""),
-                "type": item.get("type", ""),
-            }
-        )
-    return results
+        return ""
+    results = response.json()
+    return results[0]["code"] if results else ""
 
 
-def city_search_options(query: str) -> list[tuple[str, str]]:
-    """Called by st_searchbox on every keystroke. Returns a list of
-    (display_label, value) tuples — value is what gets stored when the
-    user clicks a suggestion; display_label is what they see in the
-    dropdown. This is what makes it a single live-search box instead
-    of a separate text input + selectbox + confirm button."""
-    matches = search_city(query)
-    return [(f"{m['name']} ({m['code']}) — {m['country']}", m["code"]) for m in matches]
+# ---------------------------------------------------------------------
+# TOOL 1: Flight search
+# ---------------------------------------------------------------------
+@tool
+def search_flights(origin_city: str, destination_city: str, departure_date: str) -> str:
+    """Search for the cheapest flights between two cities.
 
+    Args:
+        origin_city: Departure city name, e.g. 'Lucknow'.
+        destination_city: Arrival city name, e.g. 'Delhi'.
+        departure_date: Date in YYYY-MM-DD format.
+    """
+    origin = resolve_city_code(origin_city)
+    destination = resolve_city_code(destination_city)
+    if not origin or not destination:
+        return f"Could not find airport codes for {origin_city} or {destination_city}."
 
-def city_picker(label: str, state_key: str):
-    """Single searchable box: type a city name, live suggestions appear,
-    click one, done — the IATA code is stored in st.session_state[state_key]."""
-    selected_code = st_searchbox(
-        city_search_options,
-        placeholder=f"{label} — type a city name",
-        key=f"{state_key}_searchbox",
-    )
-    st.session_state[state_key] = selected_code or ""
-
-
-def search_flights(origin: str, destination: str, departure_date: str) -> list[dict]:
-    """Search for the cheapest flights between two cities. Returns a list
-    of flight dicts (empty list if none found), not a formatted string,
-    so the UI can render each result as its own card."""
     url = "https://api.travelpayouts.com/aviasales/v3/prices_for_dates"
     params = {
-        "origin": origin.upper(),
-        "destination": destination.upper(),
+        "origin": origin,
+        "destination": destination,
         "departure_at": departure_date,
         "sorting": "price",
         "direct": "false",
@@ -125,62 +103,139 @@ def search_flights(origin: str, destination: str, departure_date: str) -> list[d
         "limit": 5,
         "token": TRAVELPAYOUTS_TOKEN,
     }
-
     response = requests.get(url, params=params)
     data = response.json()
 
     if not data.get("success") or not data.get("data"):
-        return []
+        return f"No cached flights found for {origin_city} to {destination_city} on {departure_date}."
 
-    return data["data"]
+    flights = sorted(data["data"], key=lambda f: f["price"])
+    lines = []
+    for f in flights:
+        link = "https://www.aviasales.com" + f.get("link", "")
+        lines.append(
+            f"₹{f['price']} — {airline_name(f.get('airline', ''))}, "
+            f"departs {f.get('departure_at', 'N/A')} — Book: {link}"
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------
-# Streamlit UI
+# TOOL 2: Hotel search
 # ---------------------------------------------------------------------
-st.set_page_config(page_title="Flight Finder", page_icon="✈️")
-st.title("✈️ Flight Finder")
-st.caption("Find the cheapest flights between two cities.")
+@tool
+def search_hotels(city_name: str, check_in: str, check_out: str) -> str:
+    """Search for hotels with cached prices in a city.
 
-col1, col2 = st.columns(2)
-with col1:
-    city_picker("From", "origin_code")
-with col2:
-    city_picker("To", "destination_code")
+    Args:
+        city_name: City name, e.g. 'Goa'.
+        check_in: Check-in date, YYYY-MM-DD.
+        check_out: Check-out date, YYYY-MM-DD (must be after check_in).
+    """
+    url = "https://engine.hotellook.com/api/v2/cache.json"
+    params = {
+        "location": city_name,
+        "checkIn": check_in,
+        "checkOut": check_out,
+        "currency": "inr",
+        "limit": 5,
+        "token": TRAVELPAYOUTS_TOKEN,
+    }
+    response = requests.get(url, params=params)
+    if response.status_code != 200:
+        return f"No cached hotel prices found for {city_name}."
 
-with st.form("flight_search_form"):
-    departure_date = st.date_input("Departure date")
-    submitted = st.form_submit_button("Search Flights")
+    data = response.json()
+    if not isinstance(data, list) or not data:
+        return f"No cached hotel prices found for {city_name} on those dates."
 
-origin = st.session_state.get("origin_code", "")
-destination = st.session_state.get("destination_code", "")
+    hotels = sorted(data, key=lambda h: h.get("priceAvg", float("inf")))
+    lines = []
+    for h in hotels:
+        link = f"https://search.hotellook.com/?hotelId={h.get('hotelId', '')}"
+        lines.append(
+            f"{h.get('hotelName', 'Unknown hotel')} — ₹{h.get('priceAvg', 'N/A')}/night, "
+            f"{h.get('stars', 'N/A')}-star — View: {link}"
+        )
+    return "\n".join(lines)
 
-if submitted:
-    if not origin or not destination:
-        st.warning("Please select both a departure and arrival city above.")
-    else:
-        with st.spinner(f"Searching flights from {origin} to {destination}..."):
-            date_str = departure_date.strftime("%Y-%m-%d")
-            flights = search_flights(origin, destination, date_str)
 
-        if not flights:
-            st.info(
-                f"No cached fares found for {origin} → {destination} on {date_str}. "
-                "Try a more commonly searched route, or a nearer date."
-            )
-        else:
-            # Results already come sorted by price from the API (sorting="price"),
-            # but sort again here defensively in case that ever changes
-            flights = sorted(flights, key=lambda f: f["price"])
-            st.success(f"Found {len(flights)} option(s), cheapest first:")
-            for flight in flights:
-                price = flight["price"]
-                airline = airline_name(flight.get("airline", ""))
-                dep_time = flight.get("departure_at", "N/A")
-                booking_link = "https://www.aviasales.com" + flight.get("link", "")
+# ---------------------------------------------------------------------
+# Build the LangGraph agent
+# ---------------------------------------------------------------------
+@st.cache_resource
+def build_graph():
+    tools = [search_flights, search_hotels]
+    llm = ChatGoogleGenerativeAI(
+        model="gemini-flash-latest",
+        google_api_key=os.environ.get("GEMINI_API_KEY")
+        or st.secrets.get("GEMINI_API_KEY", ""),
+    )
+    llm_with_tools = llm.bind_tools(tools)
 
-                with st.container(border=True):
-                    st.markdown(f"### ₹{price}")
-                    st.write(f"**Airline:** {airline}")
-                    st.write(f"**Departs:** {dep_time}")
-                    st.link_button("Book this flight", booking_link)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    def agent_node(state: MessagesState):
+        system_note = {
+            "role": "system",
+            "content": f"Today's date is {today}. When the user gives a relative date "
+            f"like 'next week' or 'in September', convert it to an actual "
+            f"YYYY-MM-DD date before calling a tool.",
+        }
+        response = llm_with_tools.invoke([system_note] + state["messages"])
+        return {"messages": [response]}
+
+    builder = StateGraph(MessagesState)
+    builder.add_node("agent", agent_node)
+    builder.add_node("tools", ToolNode(tools))
+    builder.add_edge(START, "agent")
+    builder.add_conditional_edges("agent", tools_condition)
+    builder.add_edge("tools", "agent")
+    return builder.compile()
+
+
+def extract_text(message) -> str:
+    if isinstance(message.content, str):
+        return message.content
+    return "".join(
+        block["text"]
+        for block in message.content
+        if isinstance(block, dict) and block.get("type") == "text"
+    )
+
+
+# ---------------------------------------------------------------------
+# Streamlit chat UI
+# ---------------------------------------------------------------------
+st.set_page_config(page_title="Travel Agent", page_icon="🧳")
+st.title("🧳 Travel Agent")
+st.caption("Ask me to find flights, hotels, or both — in plain English.")
+st.caption(
+    'e.g. "Find me cheap flights from Lucknow to Delhi on Aug 15" or "hotels in Goa for 3 nights starting Sept 1"'
+)
+
+graph = build_graph()
+
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+for role, text in st.session_state.messages:
+    with st.chat_message(role):
+        st.write(text)
+
+user_input = st.chat_input("Ask about flights or hotels...")
+
+if user_input:
+    st.session_state.messages.append(("user", user_input))
+    with st.chat_message("user"):
+        st.write(user_input)
+
+    graph_messages = [(role, text) for role, text in st.session_state.messages]
+
+    with st.chat_message("assistant"):
+        with st.spinner("Searching..."):
+            result = graph.invoke({"messages": graph_messages})
+            answer = extract_text(result["messages"][-1])
+            st.write(answer)
+
+    st.session_state.messages.append(("assistant", answer))
