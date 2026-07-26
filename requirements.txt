@@ -1,5 +1,6 @@
 streamlit
 langchain
 langchain-google-genai
+requests
 pypdf
 python-docx
